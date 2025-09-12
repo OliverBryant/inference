@@ -37,6 +37,9 @@ from ....types import (
     max_tokens_field,
 )
 from ...scheduler.request import InferenceRequest
+# NOTE: Transformers path currently lacks token-level FSM decoding like vLLM.
+# We still normalize guided_* fields upstream so future logits processors
+# can leverage them. For now, we rely on prompt-level steering.
 
 if TYPE_CHECKING:
     from ...llm.transformers.core import PytorchModel

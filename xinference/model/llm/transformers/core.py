@@ -938,6 +938,46 @@ class PytorchChatModel(PytorchModel, ChatModelMixin):
 
     def _get_full_prompt(self, messages: List[Dict], tools, generate_config: dict):
         model_family = self.model_family.model_family or self.model_family.model_name
+        # Inject structured output instruction if response_format is provided
+        try:
+            response_format = None
+            if isinstance(generate_config, dict):
+                response_format = generate_config.get("response_format")
+            if response_format:
+                rftype = response_format.get("type") if isinstance(response_format, dict) else None
+                if rftype == "json_schema":
+                    jf = response_format.get("json_schema", {}) if isinstance(response_format, dict) else {}
+                    # Accept multiple aliases for schema key
+                    schema_obj = None
+                    if isinstance(jf, dict):
+                        schema_obj = jf.get("schema") or jf.get("schema_") or jf.get("json_schema")
+                        if schema_obj is None:
+                            possible = {k: v for k, v in jf.items() if k in ("type", "properties", "required", "$schema")}
+                            if possible:
+                                schema_obj = jf
+                    if schema_obj is not None:
+                        sys_msg = {
+                            "role": "system",
+                            "content": (
+                                "You must output only a valid JSON object that strictly adheres to the following JSON Schema. "
+                                "Do not include any additional text, explanations, code fences, or trailing commentary.\n\n"
+                                f"JSON Schema:\n{json.dumps(schema_obj, ensure_ascii=False)}"
+                            ),
+                        }
+                        messages = [sys_msg] + messages
+                elif rftype == "json_object":
+                    sys_msg = {
+                        "role": "system",
+                        "content": (
+                            "You must output only a valid JSON object. Do not include any additional text, "
+                            "explanations, code fences, or trailing commentary."
+                        ),
+                    }
+                    messages = [sys_msg] + messages
+        except Exception:
+            # Best effort: never break prompt building due to injection issues
+            pass
+
         chat_template_kwargs = (
             self._get_chat_template_kwargs_from_generate_config(
                 generate_config, self.reasoning_parser
@@ -961,6 +1001,36 @@ class PytorchChatModel(PytorchModel, ChatModelMixin):
             **full_context_kwargs,
         )
         return full_prompt
+
+    def prepare_sanitize_generate_config(self, req: InferenceRequest):
+        gen = req.generate_config
+        # Normalize OpenAI response_format to guided_* params for structured output
+        if isinstance(gen, dict) and gen.get("response_format"):
+            rf = gen.get("response_format")
+            try:
+                if hasattr(rf, "dict"):
+                    rf = rf.dict(by_alias=True)
+            except Exception:
+                pass
+            if isinstance(rf, dict):
+                rftype = rf.get("type")
+                if rftype == "json_object":
+                    gen = dict(gen)
+                    gen["guided_json_object"] = True
+                elif rftype == "json_schema":
+                    js = rf.get("json_schema") or {}
+                    schema = None
+                    if isinstance(js, dict):
+                        schema = js.get("schema") or js.get("schema_") or js.get("json_schema")
+                        if schema is None:
+                            possible = {k: v for k, v in js.items() if k in ("type", "properties", "required", "$schema")}
+                            if possible:
+                                schema = js
+                    if schema is not None:
+                        gen = dict(gen)
+                        gen["guided_json"] = json.dumps(schema)
+        req.sanitized_generate_config = self._sanitize_generate_config(gen)
+        return req.sanitized_generate_config
 
     def prepare_batch_inference(self, req_list: List[InferenceRequest]):
         super().prepare_batch_inference(req_list)

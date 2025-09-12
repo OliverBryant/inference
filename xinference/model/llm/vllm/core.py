@@ -830,6 +830,12 @@ class VLLMModel(LLM):
             "guided_json_object",
             generate_config.get("guided_json_object", guided_json_object),
         )
+        # Keep backend configurable if provided upstream (compatible with structured_output backends)
+        if "guided_decoding_backend" in generate_config:
+            sanitized.setdefault(
+                "guided_decoding_backend",
+                generate_config.get("guided_decoding_backend"),
+            )
 
         return sanitized
 
