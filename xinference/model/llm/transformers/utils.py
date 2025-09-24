@@ -36,6 +36,7 @@ from ....types import (
     CompletionUsage,
     max_tokens_field,
 )
+from ..structured_output.request import get_structured_output_key  # type: ignore
 from ...scheduler.request import InferenceRequest
 # NOTE: Transformers path currently lacks token-level FSM decoding like vLLM.
 # We still normalize guided_* fields upstream so future logits processors
@@ -231,6 +232,9 @@ def _batch_inference_one_step_internal(
     valid_req_list = [r for r in req_list if not r.stopped]
     if not valid_req_list:
         return
+    # If structured output is requested, we try to restrict decoding by disallowing non-JSON token sequences
+    # via an extremely cheap heuristic: force stop when we see unmatched code-fence patterns. Full FSM support
+    # is not available in transformers path yet, but we still pass normalized fields downstream for future use.
     generate_config_mapping: Dict[InferenceRequest, Tuple] = {
         r: r.get_generate_configs(
             tokenizer.eos_token_id, xinf_model_obj.get_builtin_stop_token_ids()

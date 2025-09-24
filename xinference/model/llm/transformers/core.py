@@ -707,7 +707,38 @@ class PytorchModel(LLM):
         return self._pytorch_model_config.get("max_num_seqs")  # type: ignore
 
     def prepare_sanitize_generate_config(self, req: InferenceRequest):
-        return self._sanitize_generate_config(req.generate_config)
+        gen = req.generate_config
+        # Normalize OpenAI response_format to vLLM-like guided params for structured output
+        if isinstance(gen, dict) and gen.get("response_format"):
+            rf = gen.get("response_format")
+            try:
+                # unify dict view
+                if hasattr(rf, "dict"):
+                    rf = rf.dict(by_alias=True)
+            except Exception:
+                pass
+            if isinstance(rf, dict):
+                rftype = rf.get("type")
+                if rftype == "json_object":
+                    gen = dict(gen)
+                    gen["guided_json_object"] = True
+                    # hf transformers path will not understand this field, but our scheduler utils will keep it
+                elif rftype == "json_schema":
+                    js = rf.get("json_schema") or {}
+                    # support pydantic alias schema_
+                    schema = None
+                    if isinstance(js, dict):
+                        schema = js.get("schema") or js.get("schema_") or js.get("json_schema")
+                        if schema is None:
+                            # when user passes pydantic model_json_schema() directly under json_schema.schema
+                            possible = {k: v for k, v in js.items() if k in ("type", "properties", "required", "$schema")}
+                            if possible:
+                                schema = js
+                    if schema is not None:
+                        gen = dict(gen)
+                        gen["guided_json"] = json.dumps(schema)
+        req.sanitized_generate_config = self._sanitize_generate_config(gen)
+        return req.sanitized_generate_config
 
     def merge_kv_cache(self, past_cache, new_cache):
         from torch.nn.functional import pad
@@ -964,6 +995,10 @@ class PytorchChatModel(PytorchModel, ChatModelMixin):
                                 f"JSON Schema:\n{json.dumps(schema_obj, ensure_ascii=False)}"
                             ),
                         }
+<<<<<<< HEAD
+=======
+                        # Prepend our system hint in front of user/system messages
+>>>>>>> 064ef72e (feat(transformers-structured-output): normalize OpenAI response_format into guided decoding fields; inject system schema hint into chat prompt; prep for future FSM backend by importing structured_output.request utils)
                         messages = [sys_msg] + messages
                 elif rftype == "json_object":
                     sys_msg = {
