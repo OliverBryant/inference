@@ -64,7 +64,7 @@ class MediaInterface:
 
     def build(self) -> gr.Blocks:
         if self.model_type == "image":
-            assert "stable_diffusion" in self.model_family
+            assert "stable_diffusion" in self.model_family or "ocr" in self.model_ability
 
         interface = self.build_main_interface()
         interface.queue()
@@ -1125,6 +1125,159 @@ class MediaInterface:
 
         return audio2text_ui
 
+    def ocr_interface(self) -> "gr.Blocks":
+        def process_image_ocr(
+            image: Optional[PIL.Image.Image],
+            progress=gr.Progress(),
+        ) -> str:
+            from ...client import RESTfulClient
+
+            if image is None:
+                return "Please upload an image first."
+
+            client = RESTfulClient(self.endpoint)
+            client._set_token(self.access_token)
+            model = client.get_model(self.model_uid)
+            assert isinstance(model, RESTfulImageModelHandle)
+
+            # Convert image to bytes
+            bio = io.BytesIO()
+            image.save(bio, format="PNG")
+
+            response = None
+            exc = None
+            request_id = str(uuid.uuid4())
+
+            def run_in_thread():
+                nonlocal exc, response
+                try:
+                    response = model.ocr(
+                        request_id=request_id,
+                        image=bio.getvalue(),
+                        ocr_type="ocr",
+                    )
+                except Exception as e:
+                    exc = e
+
+            t = threading.Thread(target=run_in_thread)
+            t.start()
+
+            # Progress tracking (simplified for OCR)
+            progress(0.5, desc="Processing image")
+            while t.is_alive():
+                time.sleep(0.1)
+
+            if exc:
+                raise exc
+
+            progress(1.0, desc="OCR complete")
+            return response if response else "No text extracted from image."
+
+        def process_image_ocr_with_prompt(
+            image: Optional[PIL.Image.Image],
+            prompt: str,
+            progress=gr.Progress(),
+        ) -> str:
+            from ...client import RESTfulClient
+
+            if image is None:
+                return "Please upload an image first."
+
+            client = RESTfulClient(self.endpoint)
+            client._set_token(self.access_token)
+            model = client.get_model(self.model_uid)
+            assert isinstance(model, RESTfulImageModelHandle)
+
+            # Convert image to bytes
+            bio = io.BytesIO()
+            image.save(bio, format="PNG")
+
+            response = None
+            exc = None
+            request_id = str(uuid.uuid4())
+
+            def run_in_thread():
+                nonlocal exc, response
+                try:
+                    response = model.ocr(
+                        request_id=request_id,
+                        image=bio.getvalue(),
+                        prompt=prompt,
+                        ocr_type="ocr",
+                    )
+                except Exception as e:
+                    exc = e
+
+            t = threading.Thread(target=run_in_thread)
+            t.start()
+
+            # Progress tracking
+            progress(0.5, desc="Processing image")
+            while t.is_alive():
+                time.sleep(0.1)
+
+            if exc:
+                raise exc
+
+            progress(1.0, desc="OCR complete")
+            return response if response else "No text extracted from image."
+
+        with gr.Blocks() as ocr_ui:
+            gr.Markdown("## OCR (Optical Character Recognition)")
+            gr.Markdown("Upload an image to extract text using PaddleOCR-VL")
+
+            with gr.Row():
+                with gr.Column(scale=1):
+                    image_input = gr.Image(
+                        label="Upload Image",
+                        type="pil",
+                        interactive=True
+                    )
+
+                    prompt_input = gr.Textbox(
+                        label="Custom Prompt (Optional)",
+                        placeholder="Enter custom instructions for text extraction",
+                        lines=2
+                    )
+
+                    process_btn = gr.Button("Extract Text", variant="primary")
+
+                with gr.Column(scale=1):
+                    output_text = gr.Textbox(
+                        label="Extracted Text",
+                        lines=10,
+                        placeholder="Extracted text will appear here...",
+                        interactive=True
+                    )
+
+                    # Basic OCR example
+                    gr.Examples(
+                        examples=[
+                            ["Extract all text from this image"],
+                            ["Please identify and extract all readable text"],
+                            ["What text is visible in this image?"]
+                        ],
+                        inputs=[prompt_input],
+                        label="Example Prompts"
+                    )
+
+            # Simple OCR button (no custom prompt)
+            simple_btn = gr.Button("Quick OCR (Extract All Text)", size="sm")
+            simple_btn.click(
+                process_image_ocr,
+                inputs=[image_input],
+                outputs=[output_text],
+            )
+
+            # Advanced OCR with custom prompt
+            process_btn.click(
+                process_image_ocr_with_prompt,
+                inputs=[image_input, prompt_input],
+                outputs=[output_text],
+            )
+
+        return ocr_ui
+
     def text2speech_interface(self) -> "gr.Blocks":
         def tts_generate(
             input_text: str,
@@ -1235,7 +1388,10 @@ class MediaInterface:
 
     def build_main_interface(self) -> "gr.Blocks":
         if self.model_type == "image":
-            title = f"🎨 Xinference Stable Diffusion: {self.model_name} 🎨"
+            if "ocr" in self.model_ability:
+                title = f"🔍 Xinference OCR: {self.model_name} 🔍"
+            else:
+                title = f"🎨 Xinference Stable Diffusion: {self.model_name} 🎨"
         elif self.model_type == "video":
             title = f"🎨 Xinference Video Generation: {self.model_name} 🎨"
         else:
@@ -1266,6 +1422,9 @@ class MediaInterface:
                     </div>
                     """
             )
+            if "ocr" in self.model_ability:
+                with gr.Tab("OCR"):
+                    self.ocr_interface()
             if "text2image" in self.model_ability:
                 with gr.Tab("Text to Image"):
                     self.text2image_interface()

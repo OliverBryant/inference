@@ -22,6 +22,7 @@ from ...types import PeftModelConfig
 from ..core import CacheableModelSpec, VirtualEnvSettings
 from ..utils import ModelInstanceInfoMixin
 from .ocr.got_ocr2 import GotOCR2Model
+from .ocr.paddle_ocr_vl import PaddleOCRVLModel
 from .stable_diffusion.core import DiffusionModel
 from .stable_diffusion.mlx import MLXDiffusionModel
 
@@ -159,18 +160,28 @@ def create_ocr_model_instance(
     model_spec: ImageModelFamilyV2,
     model_path: Optional[str] = None,
     **kwargs,
-) -> GotOCR2Model:
+) -> Union[GotOCR2Model, PaddleOCRVLModel]:
     from .cache_manager import ImageCacheManager
 
     if not model_path:
         cache_manager = ImageCacheManager(model_spec)
         model_path = cache_manager.cache()
-    model = GotOCR2Model(
-        model_uid,
-        model_path,
-        model_spec=model_spec,
-        **kwargs,
-    )
+
+    # Choose appropriate OCR model based on model family
+    if model_spec.model_family == "paddle_ocr":
+        model = PaddleOCRVLModel(
+            model_uid,
+            model_path,
+            model_spec=model_spec,
+            **kwargs,
+        )
+    else:  # Default to GOT-OCR2
+        model = GotOCR2Model(
+            model_uid,
+            model_path,
+            model_spec=model_spec,
+            **kwargs,
+        )
     return model
 
 
@@ -187,7 +198,7 @@ def create_image_model_instance(
     lightning_version: Optional[str] = None,
     lightning_model_path: Optional[str] = None,
     **kwargs,
-) -> Union[DiffusionModel, MLXDiffusionModel, GotOCR2Model]:
+) -> Union[DiffusionModel, MLXDiffusionModel, GotOCR2Model, PaddleOCRVLModel]:
     from .cache_manager import ImageCacheManager
 
     model_spec = match_diffusion(model_name, download_hub)
