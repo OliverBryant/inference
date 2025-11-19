@@ -757,107 +757,290 @@ class IndexTTS2:
         emo_text=None,
         use_random=False,
         chunk_size_samples=22050,  # 1 second chunks at 22050Hz
+        interval_silence=200,
         verbose=False,
         max_text_tokens_per_segment=120,
         **generation_kwargs,
     ):
         """
-        Streaming inference for IndexTTS2.
-        Generates audio chunks incrementally to reduce latency.
+        真正的流式推理：边合成边输出。
+        每个文本分段完成声码器生成后立即按 chunk_size_samples 切片 yield，段间插入可选静音。
 
-        Args:
-            chunk_size_samples: Number of audio samples per chunk (default: 22050 = 1 second at 22050Hz)
-            Other args are the same as the infer() method
-
-        Yields:
-            numpy.ndarray: Audio chunks as float32 arrays
+        Returns:
+            生成的音频分块（float32 numpy 数组，取值 [-1, 1]）
         """
-        print(">> starting streaming inference...")
+        print(">> starting streaming inference (chunked)...")
 
-        # For initial implementation, we'll use a memory-optimized approach:
-        # Generate the complete audio first, then yield it in chunks
-        # This provides streaming output while maintaining audio quality
+        if use_emo_text or emo_vector is not None:
+            emo_audio_prompt = None
+        if use_emo_text:
+            if emo_text is None:
+                emo_text = text
+            emo_dict = self.qwen_emo.inference(emo_text)
+            print(f"detected emotion vectors from text: {emo_dict}")
+            emo_vector = list(emo_dict.values())
+        if emo_vector is not None:
+            emo_vector_scale = max(0.0, min(1.0, emo_alpha))
+            if emo_vector_scale != 1.0:
+                emo_vector = [
+                    int(x * emo_vector_scale * 10000) / 10000 for x in emo_vector
+                ]
+                print(f"scaled emotion vectors to {emo_vector_scale}x: {emo_vector}")
+        if emo_audio_prompt is None:
+            emo_audio_prompt = spk_audio_prompt
+            emo_alpha = 1.0
 
-        # Reuse the existing inference logic but get the audio tensor directly
-        temp_output_path = None
-        import os
-        import tempfile
+        if (
+            self.cache_spk_cond is None
+            or self.cache_spk_audio_prompt != spk_audio_prompt
+        ):
+            audio, sr = self._load_and_cut_audio(spk_audio_prompt, 15, verbose)
+            audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
+            audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
 
-        try:
-            # print(">> Creating temporary file...")
-            # Create a temporary file for the complete audio
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-                temp_output_path = temp_file.name
+            inputs = self.extract_features(
+                audio_16k, sampling_rate=16000, return_tensors="pt"
+            )
+            input_features = inputs["input_features"]
+            attention_mask = inputs["attention_mask"]
+            input_features = input_features.to(self.device)
+            attention_mask = attention_mask.to(self.device)
+            spk_cond_emb = self.get_emb(input_features, attention_mask)
 
-            # print(f">> Generating audio to: {temp_output_path}")
-            # Generate complete audio using existing infer method
-            # Note: For memory efficiency, we could modify this to work with in-memory tensors
-            # in a future version, but this approach ensures maximum compatibility
-            self.infer(
-                spk_audio_prompt=spk_audio_prompt,
-                text=text,
-                output_path=temp_output_path,
-                emo_audio_prompt=emo_audio_prompt,
-                emo_alpha=emo_alpha,
-                emo_vector=emo_vector,
-                use_emo_text=use_emo_text,
-                emo_text=emo_text,
-                use_random=use_random,
-                verbose=verbose,
-                max_text_tokens_per_segment=max_text_tokens_per_segment,
-                **generation_kwargs,
+            _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
+            ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
+            ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
+            feat = torchaudio.compliance.kaldi.fbank(
+                audio_16k.to(ref_mel.device),
+                num_mel_bins=80,
+                dither=0,
+                sample_frequency=16000,
+            )
+            feat = feat - feat.mean(dim=0, keepdim=True)
+            style = self.campplus_model(feat.unsqueeze(0))
+
+            prompt_condition = self.s2mel.models["length_regulator"](
+                S_ref, ylens=ref_target_lengths, n_quantizers=3, f0=None
+            )[0]
+
+            self.cache_spk_cond = spk_cond_emb
+            self.cache_s2mel_style = style
+            self.cache_s2mel_prompt = prompt_condition
+            self.cache_spk_audio_prompt = spk_audio_prompt
+            self.cache_mel = ref_mel
+        else:
+            style = self.cache_s2mel_style
+            prompt_condition = self.cache_s2mel_prompt
+            spk_cond_emb = self.cache_spk_cond
+            ref_mel = self.cache_mel
+
+        emovec_mat = None
+        weight_vector = None
+        if emo_vector is not None:
+            weight_vector = torch.tensor(emo_vector).to(self.device)
+            if use_random:
+                random_index = [random.randint(0, x - 1) for x in self.emo_num]
+            else:
+                random_index = [
+                    find_most_similar_cosine(style, tmp) for tmp in self.spk_matrix
+                ]
+
+            emo_matrix = [
+                tmp[index].unsqueeze(0)
+                for index, tmp in zip(random_index, self.emo_matrix)
+            ]
+            emo_matrix = torch.cat(emo_matrix, 0)
+            emovec_mat = weight_vector.unsqueeze(1) * emo_matrix
+
+        if (
+            self.cache_emo_cond is None
+            or self.cache_emo_audio_prompt != emo_audio_prompt
+        ):
+            emo_audio, _ = self._load_and_cut_audio(
+                emo_audio_prompt, 15, verbose, sr=16000
+            )
+            emo_inputs = self.extract_features(
+                emo_audio, sampling_rate=16000, return_tensors="pt"
+            )
+            emo_input_features = emo_inputs["input_features"]
+            emo_attention_mask = emo_inputs["attention_mask"]
+            emo_input_features = emo_input_features.to(self.device)
+            emo_attention_mask = emo_attention_mask.to(self.device)
+            emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
+
+            self.cache_emo_cond = emo_cond_emb
+            self.cache_emo_audio_prompt = emo_audio_prompt
+        else:
+            emo_cond_emb = self.cache_emo_cond
+
+        self._set_gr_progress(0.1, "text processing...")
+        text_tokens_list = self.tokenizer.tokenize(text)
+        segments = self.tokenizer.split_segments(
+            text_tokens_list, max_text_tokens_per_segment
+        )
+        segments_count = len(segments)
+
+        do_sample = generation_kwargs.pop("do_sample", True)
+        top_p = generation_kwargs.pop("top_p", 0.8)
+        top_k = generation_kwargs.pop("top_k", 30)
+        temperature = generation_kwargs.pop("temperature", 0.8)
+        autoregressive_batch_size = 1
+        length_penalty = generation_kwargs.pop("length_penalty", 0.0)
+        num_beams = generation_kwargs.pop("num_beams", 3)
+        repetition_penalty = generation_kwargs.pop("repetition_penalty", 10.0)
+        max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 1500)
+        sampling_rate = 22050
+
+        has_warned = False
+        sil_samples = int(sampling_rate * interval_silence / 1000.0)
+        silence_chunk = (
+            np.zeros(min(sil_samples, chunk_size_samples), dtype=np.float32)
+            if interval_silence > 0
+            else None
+        )
+
+        for seg_idx, sent in enumerate(segments):
+            self._set_gr_progress(
+                0.2 + 0.7 * seg_idx / segments_count,
+                f"speech synthesis {seg_idx + 1}/{segments_count}...",
             )
 
-            # print(">> Loading generated audio...")
-            # Load the generated audio
-            import torchaudio
+            text_tokens = self.tokenizer.convert_tokens_to_ids(sent)
+            text_tokens = torch.tensor(
+                text_tokens, dtype=torch.int32, device=self.device
+            ).unsqueeze(0)
 
-            wav, sample_rate = torchaudio.load(temp_output_path)
-            wav = wav.squeeze(0)  # Remove channel dimension if present
+            with torch.no_grad():
+                with torch.amp.autocast(
+                    text_tokens.device.type,
+                    enabled=self.dtype is not None,
+                    dtype=self.dtype,
+                ):
+                    emovec = self.gpt.merge_emovec(
+                        spk_cond_emb,
+                        emo_cond_emb,
+                        torch.tensor(
+                            [spk_cond_emb.shape[-1]], device=text_tokens.device
+                        ),
+                        torch.tensor(
+                            [emo_cond_emb.shape[-1]], device=text_tokens.device
+                        ),
+                        alpha=emo_alpha,
+                    )
 
-            # Convert to numpy and normalize to float32 [-1, 1]
-            wav_numpy = wav.numpy().astype(np.float32)
-            if wav_numpy.dtype != np.float32:
-                wav_numpy = wav_numpy / 32768.0  # Convert from int16 to float32
+                    if emo_vector is not None:
+                        emovec = emovec_mat + (1 - torch.sum(weight_vector)) * emovec
 
-            # print(f">> Audio loaded: {len(wav_numpy)} samples at {sample_rate}Hz")
-            # Memory optimization: process in chunks without storing entire audio
-            total_samples = len(wav_numpy)
-            yielded_samples = 0
-            chunk_count = 0
+                    codes, speech_conditioning_latent = self.gpt.inference_speech(
+                        spk_cond_emb,
+                        text_tokens,
+                        emo_cond_emb,
+                        cond_lengths=torch.tensor(
+                            [spk_cond_emb.shape[-1]], device=text_tokens.device
+                        ),
+                        emo_cond_lengths=torch.tensor(
+                            [emo_cond_emb.shape[-1]], device=text_tokens.device
+                        ),
+                        emo_vec=emovec,
+                        do_sample=do_sample,
+                        top_p=top_p,
+                        top_k=top_k,
+                        temperature=temperature,
+                        num_return_sequences=autoregressive_batch_size,
+                        length_penalty=length_penalty,
+                        num_beams=num_beams,
+                        repetition_penalty=repetition_penalty,
+                        max_generate_length=max_mel_tokens,
+                        **generation_kwargs,
+                    )
 
-            for start_idx in range(0, total_samples, chunk_size_samples):
-                end_idx = min(start_idx + chunk_size_samples, total_samples)
-                chunk = wav_numpy[start_idx:end_idx]
+                if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
+                    warnings.warn(
+                        f"WARN: generation stopped due to exceeding `max_mel_tokens` ({max_mel_tokens}). "
+                        f"Input text tokens: {text_tokens.shape[1]}. "
+                        f"Consider reducing `max_text_tokens_per_segment`({max_text_tokens_per_segment}) or increasing `max_mel_tokens`.",
+                        category=RuntimeWarning,
+                    )
+                    has_warned = True
 
-                if len(chunk) > 0:  # Only yield non-empty chunks
-                    chunk_count += 1
-                    # print(f">> Yielding chunk {chunk_count}: {len(chunk)} samples")
-                    yield chunk
-                    yielded_samples += len(chunk)
+                code_lens = torch.tensor(
+                    [codes.shape[-1]], device=codes.device, dtype=torch.long
+                )
 
-                # Memory cleanup: allow garbage collection of processed chunks
-                if start_idx > 0 and start_idx % (chunk_size_samples * 10) == 0:
-                    # Periodically suggest garbage collection for long audio
-                    import gc
+                use_speed = (
+                    torch.zeros(spk_cond_emb.size(0)).to(spk_cond_emb.device).long()
+                )
+                with torch.amp.autocast(
+                    text_tokens.device.type,
+                    enabled=self.dtype is not None,
+                    dtype=self.dtype,
+                ):
+                    latent = self.gpt(
+                        speech_conditioning_latent,
+                        text_tokens,
+                        torch.tensor(
+                            [text_tokens.shape[-1]], device=text_tokens.device
+                        ),
+                        codes,
+                        torch.tensor([codes.shape[-1]], device=text_tokens.device),
+                        emo_cond_emb,
+                        cond_mel_lengths=torch.tensor(
+                            [spk_cond_emb.shape[-1]], device=text_tokens.device
+                        ),
+                        emo_cond_mel_lengths=torch.tensor(
+                            [emo_cond_emb.shape[-1]], device=text_tokens.device
+                        ),
+                        emo_vec=emovec,
+                        use_speed=use_speed,
+                    )
 
-                    gc.collect()
+                dtype = None
+                with torch.amp.autocast(
+                    text_tokens.device.type, enabled=dtype is not None, dtype=dtype
+                ):
+                    latent = self.s2mel.models["gpt_layer"](latent)
+                    S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
+                    S_infer = S_infer.transpose(1, 2)
+                    S_infer = S_infer + latent
+                    target_lengths = (code_lens * 1.72).long()
 
-            # print(f">> Streaming complete: yielded {yielded_samples} samples in {chunk_count} chunks")
+                    cond = self.s2mel.models["length_regulator"](
+                        S_infer, ylens=target_lengths, n_quantizers=3, f0=None
+                    )[0]
+                    cat_condition = torch.cat([prompt_condition, cond], dim=1)
+                    vc_target = self.s2mel.models["cfm"].inference(
+                        cat_condition,
+                        torch.LongTensor([cat_condition.size(1)]).to(cond.device),
+                        ref_mel,
+                        style,
+                        None,
+                        diffusion_steps=25,
+                        inference_cfg_rate=0.7,
+                    )
+                    vc_target = vc_target[:, :, ref_mel.size(-1) :]
 
-        except Exception as e:
-            # print(f">> Error in streaming inference: {e}")
-            # import traceback
-            # traceback.print_exc()
-            raise
-        finally:
-            # Clean up temporary file
-            if temp_output_path and os.path.exists(temp_output_path):
-                try:
-                    os.unlink(temp_output_path)
-                    # print(f">> Cleaned up temp file: {temp_output_path}")
-                except:
-                    pass
+                    wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
+                    wav = wav.squeeze(1)
+
+                wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
+                wav_numpy = wav.cpu().numpy().flatten().astype(np.float32) / 32768.0
+
+                for start_idx in range(0, len(wav_numpy), chunk_size_samples):
+                    end_idx = min(start_idx + chunk_size_samples, len(wav_numpy))
+                    chunk = wav_numpy[start_idx:end_idx]
+                    if len(chunk) > 0:
+                        yield chunk
+
+            # 段间静音
+            if interval_silence > 0 and seg_idx < segments_count - 1:
+                remaining = sil_samples
+                while remaining > 0:
+                    chunk_len = min(chunk_size_samples, remaining)
+                    if silence_chunk is None or len(silence_chunk) != chunk_len:
+                        yield np.zeros(chunk_len, dtype=np.float32)
+                    else:
+                        yield silence_chunk
+                    remaining -= chunk_len
 
 
 def find_most_similar_cosine(query_vector, matrix):
