@@ -71,6 +71,9 @@ def create_model_instance(
         return create_image_model_instance(
             model_uid,
             model_name,
+            model_engine,
+            model_format,
+            quantization,
             peft_model_config,
             download_hub,
             model_path,

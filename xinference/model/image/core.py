@@ -21,10 +21,7 @@ from typing import Dict, List, Literal, Optional, Union
 from ...types import PeftModelConfig
 from ..core import CacheableModelSpec, VirtualEnvSettings
 from ..utils import ModelInstanceInfoMixin
-from .ocr.deepseek_ocr import DeepSeekOCRModel
-from .ocr.got_ocr2 import GotOCR2Model
-from .ocr.hunyuan_ocr import HunyuanOCRModel
-from .ocr.paddleocr_vl import PaddleOCRVLModel
+from .ocr.ocr_family import OCRModelProtocol
 from .stable_diffusion.core import DiffusionModel
 from .stable_diffusion.mlx import MLXDiffusionModel
 
@@ -161,49 +158,62 @@ def create_ocr_model_instance(
     model_uid: str,
     model_spec: ImageModelFamilyV2,
     model_path: Optional[str] = None,
+    model_engine: Optional[str] = None,
+    model_format: Optional[str] = None,
+    quantization: Optional[str] = None,
     **kwargs,
-) -> Union[DeepSeekOCRModel, GotOCR2Model, HunyuanOCRModel, PaddleOCRVLModel]:
+) -> OCRModelProtocol:
     from .cache_manager import ImageCacheManager
+    from .ocr.ocr_family import check_engine_by_model_name_and_engine
 
-    if not model_path:
-        cache_manager = ImageCacheManager(model_spec)
-        model_path = cache_manager.cache()
+    if model_engine is None:
+        model_engine = "transformers"
 
-    # Choose OCR model based on model_name
-    if model_spec.model_name == "DeepSeek-OCR":
-        return DeepSeekOCRModel(
-            model_uid,
-            model_path,
-            model_spec=model_spec,
-            **kwargs,
-        )
-    if model_spec.model_name == "HunyuanOCR":
-        return HunyuanOCRModel(
-            model_uid,
-            model_path,
-            model_spec=model_spec,
-            **kwargs,
-        )
-    elif model_spec.model_name == "PaddleOCR-VL":
-        return PaddleOCRVLModel(
-            model_uid,
-            model_path,
-            model_spec=model_spec,
-            **kwargs,
-        )
+    normalized_engine = None
+    from .ocr.ocr_family import OCR_ENGINES
+
+    for engine in OCR_ENGINES.get(model_spec.model_name, {}):
+        if engine.lower() == model_engine.lower():
+            normalized_engine = engine
+            break
+    if normalized_engine:
+        model_engine = normalized_engine
+
+    ocr_cls, matched_spec = check_engine_by_model_name_and_engine(
+        model_engine,
+        model_spec.model_name,
+        model_format,
+        quantization,
+    )
+
+    if model_engine == "mlx":
+        if matched_spec.get("model_id"):
+            kwargs.setdefault("mlx_model_id", matched_spec.get("model_id"))
+        if (
+            matched_spec.get("quantization")
+            and matched_spec.get("quantization") != "none"
+        ):
+            kwargs.setdefault("mlx_quantization", matched_spec.get("quantization"))
     else:
-        # Default to GOT-OCR2 for other OCR models
-        return GotOCR2Model(
-            model_uid,
-            model_path,
-            model_spec=model_spec,
-            **kwargs,
-        )
+        if not model_path:
+            cache_manager = ImageCacheManager(model_spec)
+            model_path = cache_manager.cache()
+
+    return ocr_cls(
+        model_uid,
+        model_path,
+        model_spec=model_spec,
+        model_engine=model_engine,
+        **kwargs,
+    )
 
 
 def create_image_model_instance(
     model_uid: str,
     model_name: str,
+    model_engine: Optional[str] = None,
+    model_format: Optional[str] = None,
+    quantization: Optional[str] = None,
     peft_model_config: Optional[PeftModelConfig] = None,
     download_hub: Optional[
         Literal["huggingface", "modelscope", "openmind_hub", "csghub"]
@@ -217,10 +227,7 @@ def create_image_model_instance(
 ) -> Union[
     DiffusionModel,
     MLXDiffusionModel,
-    GotOCR2Model,
-    DeepSeekOCRModel,
-    HunyuanOCRModel,
-    PaddleOCRVLModel,
+    OCRModelProtocol,
 ]:
     from .cache_manager import ImageCacheManager
 
@@ -230,6 +237,9 @@ def create_image_model_instance(
             model_uid=model_uid,
             model_spec=model_spec,
             model_path=model_path,
+            model_engine=model_engine,
+            model_format=model_format,
+            quantization=quantization,
             **kwargs,
         )
 

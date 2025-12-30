@@ -640,10 +640,7 @@ def get_engine_params_by_name(
         return engine_params
 
     elif model_type == "embedding":
-        from .embedding.embed_family import (
-            BUILTIN_EMBEDDING_MODELS,
-            EMBEDDING_ENGINES,
-        )
+        from .embedding.embed_family import BUILTIN_EMBEDDING_MODELS, EMBEDDING_ENGINES
         from .embedding.embed_family import (
             SUPPORTED_ENGINES as EMBEDDING_SUPPORTED_ENGINES,
         )
@@ -682,6 +679,17 @@ def get_engine_params_by_name(
         rerank_family = rerank_family_list[0] if rerank_family_list else None
         _collect_supported_engines(rerank_family, RERANK_SUPPORTED_ENGINES, "rerank")
 
+        return engine_params
+
+    elif model_type == "image":
+        from .image.ocr.ocr_family import OCR_ENGINES
+
+        if model_name not in OCR_ENGINES:
+            return None
+
+        available_engines = deepcopy(OCR_ENGINES[model_name])
+        for engine, params in available_engines.items():
+            _append_available_engine(engine, params, "ocr_class")
         return engine_params
 
     raise ValueError(

@@ -1400,22 +1400,24 @@ class MediaInterface:
                                 logger.warning("OCR returned empty text")
                                 logger.warning(f"Full response: {response}")
                                 # Return a helpful message instead of empty result
-                                text_result = """**OCR Recognition Complete, No Text Detected**
-
-**Possible Reasons:**
-- Text in image is unclear or insufficient resolution
-- Image format not supported
-- Model unable to recognize text in image
-
-**Suggestions:**
-- Try uploading a clearer image
-- Ensure text in image is clear and legible
-- Handwritten text may have poor results
-
-**Technical Information:**
-- Model Status: Normal
-- Image Size: Original {image.size if image else 'Unknown'}, Processed {response.get('image_size', 'Unknown')}
-- Processing Mode: {response.get('model_size', 'Unknown')}"""
+                                original_size = image.size if image else "Unknown"
+                                processed_size = response.get("image_size", "Unknown")
+                                processing_mode = response.get("model_size", "Unknown")
+                                text_result = (
+                                    "**OCR Recognition Complete, No Text Detected**\n\n"
+                                    "**Possible Reasons:**\n"
+                                    "- Text in image is unclear or insufficient resolution\n"
+                                    "- Image format not supported\n"
+                                    "- Model unable to recognize text in image\n\n"
+                                    "**Suggestions:**\n"
+                                    "- Try uploading a clearer image\n"
+                                    "- Ensure text in image is clear and legible\n"
+                                    "- Handwritten text may have poor results\n\n"
+                                    "**Technical Information:**\n"
+                                    f"- Model Status: Normal\n"
+                                    f"- Image Size: Original {original_size}, Processed {processed_size}\n"
+                                    f"- Processing Mode: {processing_mode}"
+                                )
                         else:
                             error_msg = response.get("error", "OCR failed")
                             error_md = f"**Error**: {error_msg}"

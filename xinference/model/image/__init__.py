@@ -32,6 +32,12 @@ from .custom import (
     register_image,
     unregister_image,
 )
+from .ocr.ocr_family import (
+    SUPPORTED_ENGINES,
+    MLXOCREngine,
+    TransformersOCREngine,
+    generate_engine_config_by_model_name,
+)
 
 
 def register_custom_model():
@@ -78,6 +84,14 @@ def _install():
 
     for ud_image in get_user_defined_images():
         IMAGE_MODEL_DESCRIPTIONS.update(generate_image_description(ud_image))
+
+    SUPPORTED_ENGINES["transformers"] = [TransformersOCREngine]
+    SUPPORTED_ENGINES["mlx"] = [MLXOCREngine]
+
+    for model_specs in BUILTIN_IMAGE_MODELS.values():
+        for model_spec in model_specs:
+            if model_spec.model_ability and "ocr" in model_spec.model_ability:
+                generate_engine_config_by_model_name(model_spec)
 
 
 def register_builtin_model():

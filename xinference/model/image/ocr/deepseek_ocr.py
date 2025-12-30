@@ -24,6 +24,8 @@ import torch
 import torch.nn as nn
 from torchvision import transforms
 
+from ....constants import XINFERENCE_MODEL_DIR
+
 if TYPE_CHECKING:
     from ..core import ImageModelFamilyV2
 
@@ -427,49 +429,110 @@ class DeepSeekOCRModel:
         # model info when loading
         self._model = None
         self._tokenizer = None
+        self._processor = None
         # info
         self._model_spec = model_spec
         self._abilities = model_spec.model_ability or []  # type: ignore
+        self._model_engine = kwargs.get("model_engine", "transformers")
+        self._mlx_model_id = kwargs.get("mlx_model_id")
+        self._mlx_quantization = kwargs.get("mlx_quantization")
         self._kwargs = kwargs
 
     @property
     def model_ability(self):
         return self._abilities
 
-    def load(self):
+    def _load_transformers(self):
         from transformers import AutoModel, AutoTokenizer
 
         logger.info(f"Loading DeepSeek-OCR model from {self._model_path}")
 
-        try:
-            self._tokenizer = AutoTokenizer.from_pretrained(
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            self._model_path,
+            trust_remote_code=True,
+            use_fast=False,
+        )
+        if self._device != "cpu":
+            # Use CUDA if available
+            model = AutoModel.from_pretrained(
                 self._model_path,
                 trust_remote_code=True,
-                use_fast=False,
+                low_cpu_mem_usage=True,
+                device_map="auto",
+                use_safetensors=True,
+                pad_token_id=self._tokenizer.eos_token_id,
             )
-            if self._device != "cpu":
-                # Use CUDA if available
-                model = AutoModel.from_pretrained(
-                    self._model_path,
-                    trust_remote_code=True,
-                    low_cpu_mem_usage=True,
-                    device_map="auto",
-                    use_safetensors=True,
-                    pad_token_id=self._tokenizer.eos_token_id,
-                )
-                self._model = model.eval()
+            self._model = model.eval()
+        else:
+            # Force CPU-only execution
+            model = AutoModel.from_pretrained(
+                self._model_path,
+                trust_remote_code=True,
+                low_cpu_mem_usage=True,
+                device_map="cpu",
+                use_safetensors=True,
+                pad_token_id=self._tokenizer.eos_token_id,
+                torch_dtype=torch.float32,  # Use float32 for CPU
+            )
+            self._model = model.eval()
+
+    def _load_mlx(self):
+        import platform
+
+        if platform.system() != "Darwin" or platform.processor() != "arm":
+            raise ValueError("MLX OCR engine only works on Apple silicon Macs.")
+
+        try:
+            from mlx_vlm import load
+        except ImportError:
+            error_message = "Failed to import module 'mlx_vlm'"
+            installation_guide = [
+                "Please make sure 'mlx_vlm' is installed. ",
+                "You can install it by `pip install mlx_vlm`\n",
+            ]
+            raise ImportError(f"{error_message}\n\n{''.join(installation_guide)}")
+
+        if not self._model_path or not os.path.isdir(self._model_path):
+            self._model_path = self._resolve_mlx_model_path()
+
+        logger.info(f"Loading DeepSeek-OCR MLX model from {self._model_path}")
+        self._model, self._processor = load(self._model_path)
+        self._tokenizer = self._processor.tokenizer  # type: ignore
+
+    def _resolve_mlx_model_path(self) -> str:
+        from huggingface_hub import snapshot_download
+        from huggingface_hub.errors import LocalEntryNotFoundError
+
+        model_id = self._mlx_model_id
+        if not model_id and self._model_path and not os.path.isdir(self._model_path):
+            model_id = self._model_path
+        if not model_id:
+            if self._mlx_quantization:
+                model_id = f"mlx-community/DeepSeek-OCR-{self._mlx_quantization}"
             else:
-                # Force CPU-only execution
-                model = AutoModel.from_pretrained(
-                    self._model_path,
-                    trust_remote_code=True,
-                    low_cpu_mem_usage=True,
-                    device_map="cpu",
-                    use_safetensors=True,
-                    pad_token_id=self._tokenizer.eos_token_id,
-                    torch_dtype=torch.float32,  # Use float32 for CPU
+                model_id = "mlx-community/DeepSeek-OCR-8bit"
+
+        cache_dir = os.path.join(XINFERENCE_MODEL_DIR, "mlx")
+        os.makedirs(cache_dir, exist_ok=True)
+        try:
+            return snapshot_download(repo_id=model_id, cache_dir=cache_dir)
+        except LocalEntryNotFoundError as exc:
+            raise ValueError(
+                "Failed to download MLX model from Hugging Face Hub. "
+                "Please check your internet connection or pre-download the model and "
+                "pass `model_path`."
+            ) from exc
+
+    def load(self):
+        try:
+            if self._model_engine == "mlx":
+                self._load_mlx()
+            elif self._model_engine in ("vllm", "sglang"):
+                raise NotImplementedError(
+                    f"DeepSeek-OCR engine {self._model_engine} is not implemented yet."
                 )
-                self._model = model.eval()
+            else:
+                self._load_transformers()
             logger.info("DeepSeek-OCR model loaded successfully")
         except Exception as e:
             logger.error(f"Failed to load DeepSeek-OCR model: {e}")
@@ -497,6 +560,13 @@ class DeepSeekOCRModel:
             OCR results as dict or list of dicts
         """
         logger.info("DeepSeek-OCR kwargs: %s", kwargs)
+        if self._model_engine == "mlx":
+            prompt = kwargs.pop("prompt", "<image>\nFree OCR.")
+            return self._ocr_mlx(image, prompt=prompt, **kwargs)
+        if self._model_engine in ("vllm", "sglang"):
+            raise NotImplementedError(
+                f"DeepSeek-OCR engine {self._model_engine} is not implemented yet."
+            )
 
         # Set default values for DeepSeek-OCR specific parameters
         prompt = kwargs.pop("prompt", "<image>\nFree OCR.")
@@ -573,6 +643,111 @@ class DeepSeekOCRModel:
         else:
             raise ValueError("Input must be a PIL Image or list of PIL Images")
 
+    def _prepare_mlx_inputs(self, image: PIL.Image.Image, prompt: str, kwargs):
+        from mlx_vlm import prepare_inputs
+
+        processor = self._processor
+        if processor is None:
+            raise RuntimeError("MLX processor is not initialized.")
+
+        tokenizer = processor if hasattr(processor, "encode") else processor.tokenizer
+        tokenizer.encode(prompt)
+        image_token_index = getattr(self._model.config, "image_token_index", None)
+
+        supports_audio = hasattr(processor, "feature_extractor") or (
+            hasattr(processor, "audio_tokenizer")
+            and processor.audio_tokenizer is not None
+        )
+        resize_shape = kwargs.pop("resize_shape", None)
+        if not supports_audio:
+            inputs = prepare_inputs(
+                processor=processor,
+                images=[image],
+                audio=None,
+                prompts=prompt,
+                image_token_index=image_token_index,
+                resize_shape=resize_shape,
+            )
+        else:
+            inputs = prepare_inputs(
+                processor=processor,
+                images=[image],
+                prompts=prompt,
+                image_token_index=image_token_index,
+                resize_shape=resize_shape,
+            )
+
+        input_ids = inputs["input_ids"]
+        pixel_values = inputs["pixel_values"]
+        mask = inputs["attention_mask"]
+        extra = {
+            k: v
+            for k, v in inputs.items()
+            if k not in ["input_ids", "pixel_values", "attention_mask"]
+        }
+        return (input_ids, pixel_values, mask, extra)
+
+    def _ocr_mlx(
+        self,
+        image: Union[PIL.Image.Image, List[PIL.Image.Image]],
+        prompt: str,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        if isinstance(image, list):
+            raise ValueError("MLX OCR engine only supports a single image.")
+
+        if self._model is None or self._processor is None:
+            self._load_mlx()
+
+        from mlx_vlm import generate as mlx_generate
+
+        if image.mode in ["RGBA", "CMYK"]:
+            image = image.convert("RGB")
+
+        generate_kwargs: Dict[str, Any] = {}
+        model_size = kwargs.pop("model_size", "gundam")
+        max_tokens = kwargs.pop("max_tokens", None)
+        max_new_tokens = kwargs.pop("max_new_tokens", None)
+        if max_tokens is None and max_new_tokens is not None:
+            max_tokens = max_new_tokens
+        if max_tokens is not None:
+            generate_kwargs["max_tokens"] = max_tokens
+
+        for key in (
+            "temperature",
+            "top_p",
+            "repetition_penalty",
+            "repetition_context_size",
+            "logit_bias",
+        ):
+            if key in kwargs:
+                generate_kwargs[key] = kwargs.pop(key)
+
+        model_config = DeepSeekOCRModelSize.from_string(model_size)
+        generate_kwargs.setdefault("base_size", model_config.base_size)
+        generate_kwargs.setdefault("image_size", model_config.image_size)
+        generate_kwargs.setdefault("cropping", model_config.crop_mode)
+
+        if "<image>" not in prompt:
+            prompt = "<image>\n" + prompt
+
+        result = mlx_generate(
+            self._model,
+            self._processor,  # type: ignore
+            prompt,
+            image=image,
+            **generate_kwargs,
+        )
+        text = result.text if hasattr(result, "text") else str(result)
+
+        return {
+            "model": "deepseek-ocr-mlx",
+            "text": text,
+            "success": True,
+            "model_size": model_size,
+            "image_size": image.size if hasattr(image, "size") else None,
+        }
+
     def visualize_ocr(
         self,
         image: Union[PIL.Image.Image, List[PIL.Image.Image]],
@@ -598,6 +773,10 @@ class DeepSeekOCRModel:
         Returns:
             OCR results with visualization information
         """
+        if self._model_engine in ("mlx", "vllm", "sglang"):
+            raise NotImplementedError(
+                f"DeepSeek-OCR engine {self._model_engine} does not support visualization."
+            )
         if self._model is None or self._tokenizer is None:
             raise RuntimeError("Model not loaded. Please call load() first.")
 
